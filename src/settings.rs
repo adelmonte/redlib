@@ -1,11 +1,10 @@
 #![allow(clippy::cmp_owned)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // CRATES
 use crate::server::ResponseExt;
-use crate::subreddit::join_until_size_limit;
-use crate::utils::{deflate_decompress, redirect, template, Preferences};
+use crate::utils::{decode_keyword_list, deflate_decompress, encode_keyword_list, normalize_keywords, redirect, set_list_cookies, template, Preferences};
 use askama::Template;
 use cookie::Cookie;
 use futures_lite::StreamExt;
@@ -24,7 +23,7 @@ struct SettingsTemplate {
 
 // CONSTANTS
 
-const PREFS: [&str; 19] = [
+const PREFS: [&str; 20] = [
 	"theme",
 	"front_page",
 	"layout",
@@ -44,6 +43,7 @@ const PREFS: [&str; 19] = [
 	"disable_visit_reddit_confirmation",
 	"video_quality",
 	"remove_default_feeds",
+	"hide_filtered",
 ];
 
 // FUNCTIONS
@@ -97,7 +97,24 @@ pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
 		};
 	}
 
+	let cookie_names = cookie_names(&parts.headers);
+	for name in ["keyword_filters", "sub_keyword_filters"] {
+		let keywords = encode_keyword_list(&normalize_keywords(form.get(name).map_or("", |v| v.as_ref())));
+		set_list_cookies(&mut response, name, &keywords, |n| cookie_names.contains(n));
+	}
+
 	Ok(response)
+}
+
+// We can't search through the cookies directly like in subreddit.rs, so instead we collect the names from the request's headers
+fn cookie_names(headers: &hyper::HeaderMap) -> HashSet<String> {
+	headers
+		.get_all("cookie")
+		.iter()
+		.flat_map(|hv| hv.to_str().unwrap_or_default().split(';'))
+		.filter_map(|c| c.split('=').next())
+		.map(|name| name.trim().to_string())
+		.collect()
 }
 
 fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body> {
@@ -147,117 +164,19 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 		};
 	}
 
-	// Get subscriptions/filters to restore from query string
-	let subscriptions = form.get("subscriptions");
-	let filters = form.get("filters");
+	let cookie_names = cookie_names(&parts.headers);
 
-	// We can't search through the cookies directly like in subreddit.rs, so instead we have to make a string out of the request's headers to search through
-	let cookies_string = parts
-		.headers
-		.get("cookie")
-		.map(|hv| hv.to_str().unwrap_or("").to_string()) // Return String
-		.unwrap_or_else(String::new); // Return an empty string if None
-
-	// If there are subscriptions to restore set them and delete any old subscriptions cookies, otherwise delete them all
-	if let Some(subscriptions) = subscriptions {
-		let sub_list: Vec<String> = subscriptions.split('+').map(str::to_string).collect();
-
-		// Start at 0 to keep track of what number we need to start deleting old subscription cookies from
-		let mut subscriptions_number_to_delete_from = 0;
-
-		// Starting at 0 so we handle the subscription cookie without a number first
-		for (subscriptions_number, list) in join_until_size_limit(&sub_list).into_iter().enumerate() {
-			let subscriptions_cookie = if subscriptions_number == 0 {
-				"subscriptions".to_string()
-			} else {
-				format!("subscriptions{subscriptions_number}")
-			};
-
-			response.insert_cookie(
-				Cookie::build((subscriptions_cookie, list))
-					.path("/")
-					.http_only(true)
-					.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
-					.into(),
-			);
-
-			subscriptions_number_to_delete_from += 1;
-		}
-
-		// While subscriptionsNUMBER= is in the string of cookies add a response removing that cookie
-		while cookies_string.contains(&format!("subscriptions{subscriptions_number_to_delete_from}=")) {
-			// Remove that subscriptions cookie
-			response.remove_cookie(format!("subscriptions{subscriptions_number_to_delete_from}"));
-
-			// Increment subscriptions cookie number
-			subscriptions_number_to_delete_from += 1;
-		}
-	} else {
-		// Remove unnumbered subscriptions cookie
-		response.remove_cookie("subscriptions".to_string());
-
-		// Starts at one to deal with the first numbered subscription cookie and onwards
-		let mut subscriptions_number_to_delete_from = 1;
-
-		// While subscriptionsNUMBER= is in the string of cookies add a response removing that cookie
-		while cookies_string.contains(&format!("subscriptions{subscriptions_number_to_delete_from}=")) {
-			// Remove that subscriptions cookie
-			response.remove_cookie(format!("subscriptions{subscriptions_number_to_delete_from}"));
-
-			// Increment subscriptions cookie number
-			subscriptions_number_to_delete_from += 1;
-		}
+	// Restore subscriptions/filters from the query string, deleting any old cookies
+	for name in ["subscriptions", "filters"] {
+		let list: Vec<String> = form.get(name).map(|v| v.split('+').map(str::to_string).collect()).unwrap_or_default();
+		set_list_cookies(&mut response, name, &list, |n| cookie_names.contains(n));
 	}
-
-	// If there are filters to restore set them and delete any old filters cookies, otherwise delete them all
-	if let Some(filters) = filters {
-		let filters_list: Vec<String> = filters.split('+').map(str::to_string).collect();
-
-		// Start at 0 to keep track of what number we need to start deleting old subscription cookies from
-		let mut filters_number_to_delete_from = 0;
-
-		// Starting at 0 so we handle the subscription cookie without a number first
-		for (filters_number, list) in join_until_size_limit(&filters_list).into_iter().enumerate() {
-			let filters_cookie = if filters_number == 0 {
-				"filters".to_string()
-			} else {
-				format!("filters{filters_number}")
-			};
-
-			response.insert_cookie(
-				Cookie::build((filters_cookie, list))
-					.path("/")
-					.http_only(true)
-					.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
-					.into(),
-			);
-
-			filters_number_to_delete_from += 1;
+	for name in ["keyword_filters", "sub_keyword_filters"] {
+		if form.get(name).is_none() && !remove_cookies {
+			continue;
 		}
-
-		// While filtersNUMBER= is in the string of cookies add a response removing that cookie
-		while cookies_string.contains(&format!("filters{filters_number_to_delete_from}=")) {
-			// Remove that filters cookie
-			response.remove_cookie(format!("filters{filters_number_to_delete_from}"));
-
-			// Increment filters cookie number
-			filters_number_to_delete_from += 1;
-		}
-	} else {
-		// Remove unnumbered filters cookie
-		response.remove_cookie("filters".to_string());
-
-		// Starts at one to deal with the first numbered subscription cookie and onwards
-		let mut filters_number_to_delete_from = 1;
-
-		// While filtersNUMBER= is in the string of cookies add a response removing that cookie
-		while cookies_string.contains(&format!("filters{filters_number_to_delete_from}=")) {
-			// Remove that sfilters cookie
-			response.remove_cookie(format!("filters{filters_number_to_delete_from}"));
-
-			// Increment filters cookie number
-			filters_number_to_delete_from += 1;
-		}
+		let list = encode_keyword_list(&decode_keyword_list(form.get(name).map_or("", |v| v.as_ref())));
+		set_list_cookies(&mut response, name, &list, |n| cookie_names.contains(n));
 	}
 
 	response
@@ -292,7 +211,7 @@ pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, Strin
 		.await
 		.map_err(|e| format!("Failed to decompress bytes: {e}"))??;
 
-	let mut prefs: Preferences = timeout(std::time::Duration::from_secs(1), async { bincode::deserialize(&out) })
+	let mut prefs = timeout(std::time::Duration::from_secs(1), async { Preferences::from_bincode(&out) })
 		.await
 		.map_err(|e| format!("Failed to deserialize preferences: {e}"))?
 		.map_err(|e| format!("Failed to deserialize bytes into Preferences struct: {e}"))?;

@@ -2,7 +2,8 @@
 #![allow(clippy::cmp_owned)]
 
 use crate::config::{self, get_setting};
-use crate::{client::json, server::RequestExt};
+use crate::subreddit::join_until_size_limit;
+use crate::{client::json, server::RequestExt, server::ResponseExt};
 use askama::Template;
 use cookie::Cookie;
 use hyper::{Body, Request, Response};
@@ -349,6 +350,9 @@ pub struct Post {
 	pub nsfw: bool,
 	pub out_url: Option<String>,
 	pub ws_url: String,
+	/// Unrendered selftext (or comment body), used for keyword filtering.
+	#[serde(skip)]
+	pub raw_text: String,
 }
 
 impl Post {
@@ -457,6 +461,7 @@ impl Post {
 				nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
 				ws_url: val(post, "websocket_url"),
 				out_url: post["data"]["url_overridden_by_dest"].as_str().map(|a| a.to_string()),
+				raw_text: if data["selftext"].is_string() { val(post, "selftext") } else { val(post, "body") },
 			});
 		}
 		Ok((posts, res["data"]["after"].as_str().unwrap_or_default().to_string()))
@@ -618,7 +623,7 @@ pub struct Params {
 }
 
 #[derive(Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[revisioned(revision = 1)]
+#[revisioned(revision = 2)]
 pub struct Preferences {
 	#[revision(start = 1)]
 	#[serde(skip_serializing, skip_deserializing)]
@@ -667,6 +672,15 @@ pub struct Preferences {
 	pub hide_score: String,
 	#[revision(start = 1)]
 	pub remove_default_feeds: String,
+	#[revision(start = 2)]
+	#[serde(default, serialize_with = "serialize_keywords", deserialize_with = "deserialize_keywords")]
+	pub keyword_filters: Vec<String>,
+	#[revision(start = 2)]
+	#[serde(default, serialize_with = "serialize_keywords", deserialize_with = "deserialize_keywords")]
+	pub sub_keyword_filters: Vec<String>,
+	#[revision(start = 2)]
+	#[serde(default)]
+	pub hide_filtered: String,
 }
 
 fn serialize_vec_with_plus<S>(vec: &[String], serializer: S) -> Result<S::Ok, S::Error>
@@ -685,6 +699,21 @@ where
 		return Ok(Vec::new());
 	}
 	Ok(string.split('+').map(|s| s.to_string()).collect())
+}
+
+/// Keywords may contain `+`, so they're serialized in their percent-encoded cookie form.
+fn serialize_keywords<S>(vec: &[String], serializer: S) -> Result<S::Ok, S::Error>
+where
+	S: Serializer,
+{
+	serializer.serialize_str(&encode_keyword_list(vec).join("+"))
+}
+
+fn deserialize_keywords<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	Ok(decode_keyword_list(&String::deserialize(deserializer)?))
 }
 
 #[derive(RustEmbed)]
@@ -725,11 +754,21 @@ impl Preferences {
 			hide_awards: setting(req, "hide_awards"),
 			hide_score: setting(req, "hide_score"),
 			remove_default_feeds: setting(req, "remove_default_feeds"),
+			keyword_filters: decode_keyword_list(&setting(req, "keyword_filters")),
+			sub_keyword_filters: decode_keyword_list(&setting(req, "sub_keyword_filters")),
+			hide_filtered: setting(req, "hide_filtered"),
 		}
 	}
 
 	pub fn to_urlencoded(&self) -> Result<String, String> {
 		serde_urlencoded::to_string(self).map_err(|e| e.to_string())
+	}
+
+	/// Deserializes bincode preferences, including exports made before the
+	/// revision 2 fields were appended: bincode is positional, so those are
+	/// padded with the encoding of three empty strings (a zero u64 length each).
+	pub fn from_bincode(bytes: &[u8]) -> Result<Self, bincode::Error> {
+		bincode::deserialize(bytes).or_else(|e| bincode::deserialize(&[bytes, &[0u8; 24]].concat()).map_err(|_| e))
 	}
 
 	pub fn to_bincode(&self) -> Result<Vec<u8>, String> {
@@ -756,31 +795,164 @@ pub fn deflate_decompress(i: Vec<u8>) -> Result<Vec<u8>, String> {
 	Ok(out)
 }
 
-/// Gets a `HashSet` of filters from the cookie in the given `Request`.
-pub fn get_filters(req: &Request<Body>) -> HashSet<String> {
-	setting(req, "filters").split('+').map(String::from).filter(|s| !s.is_empty()).collect::<HashSet<String>>()
+/// Settings whose values are `+`-separated lists split across numbered cookies
+/// (`name`, `name1`, `name2`, ...) to stay under the per-cookie size limit.
+pub const LIST_SETTINGS: [&str; 4] = ["subscriptions", "filters", "keyword_filters", "sub_keyword_filters"];
+
+/// Writes a list setting across as many numbered cookies as needed and removes
+/// stale numbered cookies left over from a longer list. `exists` reports
+/// whether the client currently has a cookie with the given name.
+pub fn set_list_cookies(response: &mut Response<Body>, name: &str, list: &[String], exists: impl Fn(&str) -> bool) {
+	let list: Vec<&String> = list.iter().filter(|s| !s.is_empty()).collect();
+	let chunks = if list.is_empty() { Vec::new() } else { join_until_size_limit(&list) };
+
+	if chunks.is_empty() {
+		response.remove_cookie(name.to_string());
+	}
+
+	for (number, chunk) in chunks.iter().enumerate() {
+		let cookie_name = if number == 0 { name.to_string() } else { format!("{name}{number}") };
+		response.insert_cookie(
+			Cookie::build((cookie_name, chunk.clone()))
+				.path("/")
+				.http_only(true)
+				.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
+				.into(),
+		);
+	}
+
+	let mut number = chunks.len().max(1);
+	while exists(&format!("{name}{number}")) {
+		response.remove_cookie(format!("{name}{number}"));
+		number += 1;
+	}
 }
 
-/// Filters a `Vec<Post>` by the given `HashSet` of filters (each filter being
-/// a subreddit name or a user name). If a `Post`'s subreddit or author is
-/// found in the filters, it is removed.
+/// Normalizes user-entered keywords (one per line) into a list.
+pub fn normalize_keywords(input: &str) -> Vec<String> {
+	let mut keywords: Vec<String> = input
+		.lines()
+		.map(|k| k.split_whitespace().collect::<Vec<_>>().join(" "))
+		.filter(|k| !k.is_empty())
+		.collect();
+	keywords.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+	keywords
+}
+
+/// Percent-encodes keywords for storage in a `+`-separated cookie value.
+pub fn encode_keyword_list(keywords: &[String]) -> Vec<String> {
+	keywords
+		.iter()
+		.map(|k| percent_encoding::utf8_percent_encode(k, percent_encoding::NON_ALPHANUMERIC).to_string())
+		.collect()
+}
+
+/// Decodes a `+`-separated, percent-encoded keyword list from a cookie value.
+pub fn decode_keyword_list(value: &str) -> Vec<String> {
+	value
+		.split('+')
+		.map(|k| percent_encoding::percent_decode_str(k).decode_utf8_lossy().trim().to_string())
+		.filter(|k| !k.is_empty())
+		.collect()
+}
+
+/// Subreddit, user and keyword filters for a request.
+pub struct Filters {
+	/// Lowercased subreddit names and `u_`-prefixed user names.
+	names: HashSet<String>,
+	/// Lowercased substrings matched against subreddit names.
+	sub_keywords: Vec<String>,
+	/// Case-insensitive whole-word match of any thread keyword.
+	keywords: Option<Regex>,
+	/// Drop filtered content silently and block direct access instead of showing notices.
+	pub hide: bool,
+}
+
+impl Filters {
+	pub fn new(req: &Request<Body>) -> Self {
+		let names: Vec<String> = setting(req, "filters").split('+').map(String::from).collect();
+		Self::from_lists(
+			&names,
+			&decode_keyword_list(&setting(req, "keyword_filters")),
+			&decode_keyword_list(&setting(req, "sub_keyword_filters")),
+			setting(req, "hide_filtered") == "on",
+		)
+	}
+
+	pub fn from_lists(names: &[String], keywords: &[String], sub_keywords: &[String], hide: bool) -> Self {
+		// `*` is a wildcard for any run of word characters, e.g. `crypto*`.
+		let patterns: Vec<String> = keywords
+			.iter()
+			.filter(|k| !k.is_empty())
+			.map(|k| regex::escape(k).replace(r"\*", r"\w*").replace(' ', r"\s+"))
+			.collect();
+		let keywords = if patterns.is_empty() {
+			None
+		} else {
+			regex::RegexBuilder::new(&format!(r"(?:^|\W)(?:{})(?:\W|$)", patterns.join("|")))
+				.case_insensitive(true)
+				.build()
+				.ok()
+		};
+
+		Self {
+			names: names.iter().filter(|s| !s.is_empty()).map(|s| s.to_lowercase()).collect(),
+			sub_keywords: sub_keywords.iter().filter(|s| !s.is_empty()).map(|s| s.to_lowercase()).collect(),
+			keywords,
+			hide,
+		}
+	}
+
+	pub fn sub_filtered(&self, sub: &str) -> bool {
+		let sub = sub.to_lowercase();
+		self.names.contains(&sub) || self.sub_keywords.iter().any(|k| sub.contains(k.as_str()))
+	}
+
+	pub fn user_filtered(&self, user: &str) -> bool {
+		self.names.contains(&format!("u_{}", user.to_lowercase()))
+	}
+
+	pub fn text_filtered(&self, text: &str) -> bool {
+		self.keywords.as_ref().is_some_and(|re| re.is_match(text))
+	}
+
+	pub fn post_filtered(&self, post: &Post) -> bool {
+		self.sub_filtered(&post.community)
+			|| self.user_filtered(&post.author.name)
+			|| self.text_filtered(&post.title)
+			|| self.text_filtered(&post.raw_text)
+			|| self.text_filtered(&post.flair.text)
+	}
+}
+
+/// Gets the [`Filters`] for the given `Request`.
+pub fn get_filters(req: &Request<Body>) -> Filters {
+	Filters::new(req)
+}
+
+/// Removes filtered posts (by subreddit, author or keyword) from a `Vec<Post>`.
 ///
 /// The first value of the return tuple is the number of posts filtered. The
-/// second return value is `true` if all posts were filtered.
-pub fn filter_posts(posts: &mut Vec<Post>, filters: &HashSet<String>) -> (u64, bool) {
+/// second return value is `true` if all posts were filtered. Both are zeroed
+/// when filtered content is hidden, so no notices are shown.
+pub fn filter_posts(posts: &mut Vec<Post>, filters: &Filters) -> (u64, bool) {
 	// This is the length of the Vec<Post> prior to applying the filter.
 	let lb: u64 = posts.len().try_into().unwrap_or(0);
 
 	if posts.is_empty() {
 		(0, false)
 	} else {
-		posts.retain(|p| !(filters.contains(&p.community) || filters.contains(&["u_", &p.author.name].concat())));
+		posts.retain(|p| !filters.post_filtered(p));
 
 		// Get the length of the Vec<Post> after applying the filter.
 		// If lb > la, then at least one post was removed.
 		let la: u64 = posts.len().try_into().unwrap_or(0);
 
-		(lb - la, posts.is_empty())
+		if filters.hide {
+			(0, false)
+		} else {
+			(lb - la, posts.is_empty())
+		}
 	}
 }
 
@@ -885,6 +1057,7 @@ pub async fn parse_post(post: &Value) -> Post {
 		nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
 		ws_url: val(post, "websocket_url"),
 		out_url: post["data"]["url_overridden_by_dest"].as_str().map(|a| a.to_string()),
+		raw_text: val(post, "selftext"),
 	}
 }
 
@@ -909,57 +1082,19 @@ pub fn param(path: &str, value: &str) -> Option<String> {
 pub fn setting(req: &Request<Body>, name: &str) -> String {
 	// Parse a cookie value from request
 
-	// If this was called with "subscriptions" and the "subscriptions" cookie has a value
-	if name == "subscriptions" && req.cookie("subscriptions").is_some() {
-		// Create subscriptions string
-		let mut subscriptions = String::new();
+	// List settings may be split across numbered cookies (name, name1, name2, ...)
+	if LIST_SETTINGS.contains(&name) && req.cookie(name).is_some() {
+		let mut value = req.cookie(name).unwrap().value().to_string();
 
-		// Default subscriptions cookie
-		if req.cookie("subscriptions").is_some() {
-			subscriptions.push_str(req.cookie("subscriptions").unwrap().value());
+		let mut number = 1;
+		while let Some(cookie) = req.cookie(&format!("{name}{number}")) {
+			value.push_str(cookie.value());
+			number += 1;
 		}
 
-		// Start with first numbered subscription cookie
-		let mut subscriptions_number = 1;
-
-		// While whatever subscriptionsNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("subscriptions{subscriptions_number}")).is_some() {
-			// Push whatever subscriptionsNUMBER cookie we're looking at into the subscriptions string
-			subscriptions.push_str(req.cookie(&format!("subscriptions{subscriptions_number}")).unwrap().value());
-
-			// Increment subscription cookie number
-			subscriptions_number += 1;
-		}
-
-		// Return the subscriptions cookies as one large string
-		subscriptions
+		value
 	}
-	// If this was called with "filters" and the "filters" cookie has a value
-	else if name == "filters" && req.cookie("filters").is_some() {
-		// Create filters string
-		let mut filters = String::new();
-
-		// Default filters cookie
-		if req.cookie("filters").is_some() {
-			filters.push_str(req.cookie("filters").unwrap().value());
-		}
-
-		// Start with first numbered filters cookie
-		let mut filters_number = 1;
-
-		// While whatever filtersNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("filters{filters_number}")).is_some() {
-			// Push whatever filtersNUMBER cookie we're looking at into the filters string
-			filters.push_str(req.cookie(&format!("filters{filters_number}")).unwrap().value());
-
-			// Increment filters cookie number
-			filters_number += 1;
-		}
-
-		// Return the filters cookies as one large string
-		filters
-	}
-	// The above two still come to this if there was no existing value
+	// List settings still come to this if there was no existing value
 	else {
 		req
 			.cookie(name)
@@ -1446,7 +1581,10 @@ pub fn get_post_url(post: &Post) -> String {
 
 #[cfg(test)]
 mod tests {
-	use super::{deflate_compress, deflate_decompress, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, url_path_basename, Post, Preferences};
+	use super::{
+		decode_keyword_list, deflate_compress, deflate_decompress, encode_keyword_list, filter_posts, format_num, format_url, normalize_keywords, parse_post, render_bullet_lists,
+		rewrite_emotes, rewrite_urls, url_path_basename, Filters, Post, Preferences,
+	};
 
 	#[test]
 	fn format_num_works() {
@@ -1538,10 +1676,74 @@ mod tests {
 			hide_awards: "off".to_owned(),
 			hide_score: "off".to_owned(),
 			remove_default_feeds: "off".to_owned(),
+			keyword_filters: vec!["foo bar".to_owned(), "c++".to_owned()],
+			sub_keyword_filters: vec![],
+			hide_filtered: "on".to_owned(),
 		};
 		let urlencoded = serde_urlencoded::to_string(prefs).expect("Failed to serialize Prefs");
 
-		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&video_quality=best&hide_sidebar_and_summary=off&use_hls=on&autoplay_videos=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&hide_awards=off&hide_score=off&remove_default_feeds=off");
+		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&video_quality=best&hide_sidebar_and_summary=off&use_hls=on&autoplay_videos=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&hide_awards=off&hide_score=off&remove_default_feeds=off&keyword_filters=foo%2520bar%2Bc%252B%252B&sub_keyword_filters=&hide_filtered=on");
+		assert_eq!(serde_urlencoded::from_str::<Preferences>(&urlencoded).unwrap().keyword_filters, vec!["foo bar", "c++"]);
+	}
+
+	async fn test_post(community: &str, author: &str, title: &str, selftext: &str, flair: &str) -> Post {
+		parse_post(&serde_json::json!({
+			"data": { "subreddit": community, "author": author, "title": title, "selftext": selftext, "link_flair_text": flair }
+		}))
+		.await
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_filters() {
+		let list = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+		let filters = Filters::from_lists(
+			&list(&["AskReddit", "u_Spammer"]),
+			&list(&["ass", "climate change", "crypto*", "c++"]),
+			&list(&["politic"]),
+			false,
+		);
+
+		assert!(filters.sub_filtered("askreddit"));
+		assert!(filters.sub_filtered("PoliticalHumor"));
+		assert!(filters.sub_filtered("politics"));
+		assert!(!filters.sub_filtered("rust"));
+		assert!(filters.user_filtered("spammer"));
+		assert!(!filters.user_filtered("someone"));
+
+		assert!(filters.text_filtered("Ass."));
+		assert!(!filters.text_filtered("first class"));
+		assert!(filters.text_filtered("Thoughts on Climate  Change?"));
+		assert!(filters.text_filtered("Cryptocurrency is up"));
+		assert!(filters.text_filtered("learning C++ today"));
+		assert!(!filters.text_filtered(""));
+
+		assert!(filters.post_filtered(&test_post("rust", "a", "Learning crypto", "", "").await));
+		assert!(filters.post_filtered(&test_post("rust", "a", "Hello", "body about climate change", "").await));
+		assert!(filters.post_filtered(&test_post("rust", "a", "Hello", "", "Crypto").await));
+		assert!(filters.post_filtered(&test_post("rust", "Spammer", "Hello", "", "").await));
+		assert!(!filters.post_filtered(&test_post("rust", "a", "Hello", "classic", "").await));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_filter_posts_hide() {
+		let filters = Filters::from_lists(&["pics".to_owned()], &[], &[], false);
+		let mut posts = vec![test_post("pics", "a", "x", "", "").await];
+		assert_eq!(filter_posts(&mut posts, &filters), (1, true));
+
+		let filters = Filters::from_lists(&["pics".to_owned()], &[], &[], true);
+		let mut posts = vec![test_post("pics", "a", "x", "", "").await, test_post("rust", "a", "x", "", "").await];
+		assert_eq!(filter_posts(&mut posts, &filters), (0, false));
+		assert_eq!(posts.len(), 1);
+	}
+
+	#[test]
+	fn test_keyword_list_encoding() {
+		let keywords = normalize_keywords("foo  bar\r\nc++\n\n  ünïcode ;=, ");
+		assert_eq!(keywords, vec!["foo bar", "c++", "ünïcode ;=,"]);
+		let encoded = encode_keyword_list(&keywords);
+		assert!(encoded.iter().all(|k| k.chars().all(|c| c.is_ascii_alphanumeric() || c == '%')));
+		assert_eq!(decode_keyword_list(&encoded.join("+")), keywords);
+		assert_eq!(decode_keyword_list("election+crypto*"), vec!["election", "crypto*"]);
 	}
 
 	#[test]
@@ -1660,7 +1862,7 @@ How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or t
 		for config in KNOWN_GOOD_CONFIGS {
 			let bytes = base2048::decode(config).unwrap();
 			let decompressed = deflate_decompress(bytes).unwrap();
-			assert!(bincode::deserialize::<Preferences>(&decompressed).is_ok());
+			assert!(Preferences::from_bincode(&decompressed).is_ok());
 		}
 	}
 
@@ -1669,7 +1871,7 @@ How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or t
 		for config in KNOWN_GOOD_CONFIGS {
 			let bytes = base2048::decode(config).unwrap();
 			let decompressed = deflate_decompress(bytes).unwrap();
-			let prefs: Preferences = bincode::deserialize(&decompressed).unwrap();
+			let prefs = Preferences::from_bincode(&decompressed).unwrap();
 			test_round_trip(&prefs, false);
 			test_round_trip(&prefs, true);
 		}

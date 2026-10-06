@@ -1,8 +1,8 @@
 #![allow(clippy::cmp_owned)]
 
 use crate::utils::{
-	catch_random, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls, setting, template, val, Post, Preferences,
-	Subreddit,
+	catch_random, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls, set_list_cookies, setting, template, val, Post,
+	Preferences, Subreddit,
 };
 use crate::{client::json, server::RequestExt, server::ResponseExt};
 use crate::{config, utils};
@@ -14,7 +14,6 @@ use hyper::{Body, Request, Response};
 use chrono::DateTime;
 use regex::Regex;
 use std::sync::LazyLock;
-use time::{Duration, OffsetDateTime};
 
 // STRUCTS
 #[derive(Template)]
@@ -146,7 +145,10 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let filters = get_filters(&req);
 
 	// If all requested subs are filtered, we don't need to fetch posts.
-	if sub_name.split('+').all(|s| filters.contains(s)) {
+	if sub_name.split('+').all(|s| filters.sub_filtered(s)) {
+		if filters.hide {
+			return error(req, &format!("r/{sub_name} has been filtered")).await;
+		}
 		Ok(template(&SubredditTemplate {
 			sub,
 			posts: Vec::new(),
@@ -356,102 +358,8 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 
 	let mut response = redirect(&path);
 
-	// If sub_list is empty remove all subscriptions cookies, otherwise update them and remove old ones
-	if sub_list.is_empty() {
-		// Remove subscriptions cookie
-		response.remove_cookie("subscriptions".to_string());
-
-		// Start with first numbered subscriptions cookie
-		let mut subscriptions_number = 1;
-
-		// While whatever subscriptionsNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("subscriptions{subscriptions_number}")).is_some() {
-			// Remove that subscriptions cookie
-			response.remove_cookie(format!("subscriptions{subscriptions_number}"));
-
-			// Increment subscriptions cookie number
-			subscriptions_number += 1;
-		}
-	} else {
-		// Start at 0 to keep track of what number we need to start deleting old subscription cookies from
-		let mut subscriptions_number_to_delete_from = 0;
-
-		// Starting at 0 so we handle the subscription cookie without a number first
-		for (subscriptions_number, list) in join_until_size_limit(&sub_list).into_iter().enumerate() {
-			let subscriptions_cookie = if subscriptions_number == 0 {
-				"subscriptions".to_string()
-			} else {
-				format!("subscriptions{subscriptions_number}")
-			};
-
-			response.insert_cookie(
-				Cookie::build((subscriptions_cookie, list))
-					.path("/")
-					.http_only(true)
-					.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
-					.into(),
-			);
-
-			subscriptions_number_to_delete_from += 1;
-		}
-
-		// While whatever subscriptionsNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("subscriptions{subscriptions_number_to_delete_from}")).is_some() {
-			// Remove that subscriptions cookie
-			response.remove_cookie(format!("subscriptions{subscriptions_number_to_delete_from}"));
-
-			// Increment subscriptions cookie number
-			subscriptions_number_to_delete_from += 1;
-		}
-	}
-
-	// If filters is empty remove all filters cookies, otherwise update them and remove old ones
-	if filters.is_empty() {
-		// Remove filters cookie
-		response.remove_cookie("filters".to_string());
-
-		// Start with first numbered filters cookie
-		let mut filters_number = 1;
-
-		// While whatever filtersNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("filters{filters_number}")).is_some() {
-			// Remove that filters cookie
-			response.remove_cookie(format!("filters{filters_number}"));
-
-			// Increment filters cookie number
-			filters_number += 1;
-		}
-	} else {
-		// Start at 0 to keep track of what number we need to start deleting old filters cookies from
-		let mut filters_number_to_delete_from = 0;
-
-		for (filters_number, list) in join_until_size_limit(&filters).into_iter().enumerate() {
-			let filters_cookie = if filters_number == 0 {
-				"filters".to_string()
-			} else {
-				format!("filters{filters_number}")
-			};
-
-			response.insert_cookie(
-				Cookie::build((filters_cookie, list))
-					.path("/")
-					.http_only(true)
-					.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
-					.into(),
-			);
-
-			filters_number_to_delete_from += 1;
-		}
-
-		// While whatever filtersNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("filters{filters_number_to_delete_from}")).is_some() {
-			// Remove that filters cookie
-			response.remove_cookie(format!("filters{filters_number_to_delete_from}"));
-
-			// Increment filters cookie number
-			filters_number_to_delete_from += 1;
-		}
-	}
+	set_list_cookies(&mut response, "subscriptions", &sub_list, |n| req.cookie(n).is_some());
+	set_list_cookies(&mut response, "filters", &filters, |n| req.cookie(n).is_some());
 
 	Ok(response)
 }
@@ -462,6 +370,11 @@ pub async fn wiki(req: Request<Body>) -> Result<Response<Body>, String> {
 	// Handle random subreddits
 	if let Ok(random) = catch_random(&sub, "/wiki").await {
 		return Ok(random);
+	}
+
+	let filters = get_filters(&req);
+	if filters.hide && sub.split('+').all(|s| filters.sub_filtered(s)) {
+		return error(req, &format!("r/{sub} has been filtered")).await;
 	}
 
 	let page = req.param("page").unwrap_or_else(|| "index".to_string());
@@ -493,6 +406,11 @@ pub async fn sidebar(req: Request<Body>) -> Result<Response<Body>, String> {
 	// Handle random subreddits
 	if let Ok(random) = catch_random(&sub, "/about/sidebar").await {
 		return Ok(random);
+	}
+
+	let filters = get_filters(&req);
+	if filters.hide && sub.split('+').all(|s| filters.sub_filtered(s)) {
+		return error(req, &format!("r/{sub} has been filtered")).await;
 	}
 
 	// Build the Reddit JSON API url
@@ -608,7 +526,8 @@ pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
 	let subreddit = subreddit(&sub, false).await?;
 
 	// Get posts
-	let (posts, _) = Post::fetch(&path, false).await?;
+	let (mut posts, _) = Post::fetch(&path, false).await?;
+	filter_posts(&mut posts, &get_filters(&req));
 
 	// Build the RSS feed
 	let channel = ChannelBuilder::default()

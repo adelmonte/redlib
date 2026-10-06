@@ -61,7 +61,10 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 	}
 
 	let filters = get_filters(&req);
-	if filters.contains(&["u_", &username].concat()) {
+	if filters.user_filtered(&username) {
+		if filters.hide {
+			return error(req, &format!("u/{username} has been filtered")).await;
+		}
 		Ok(template(&UserTemplate {
 			user,
 			posts: Vec::new(),
@@ -152,7 +155,8 @@ pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
 	let user_obj = user(&user_str).await.unwrap_or_default();
 
 	// Get posts
-	let (posts, _) = Post::fetch(&path, false).await?;
+	let (mut posts, _) = Post::fetch(&path, false).await?;
+	filter_posts(&mut posts, &get_filters(&req));
 
 	// Build the RSS feed
 	let channel = ChannelBuilder::default()

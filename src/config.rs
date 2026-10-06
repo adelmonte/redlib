@@ -108,6 +108,15 @@ pub struct Config {
 
 	#[serde(rename = "REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS")]
 	pub(crate) default_remove_default_feeds: Option<String>,
+
+	#[serde(rename = "REDLIB_DEFAULT_KEYWORD_FILTERS")]
+	pub(crate) default_keyword_filters: Option<String>,
+
+	#[serde(rename = "REDLIB_DEFAULT_SUB_KEYWORD_FILTERS")]
+	pub(crate) default_sub_keyword_filters: Option<String>,
+
+	#[serde(rename = "REDLIB_DEFAULT_HIDE_FILTERED")]
+	pub(crate) default_hide_filtered: Option<String>,
 }
 
 impl Config {
@@ -156,6 +165,9 @@ impl Config {
 			enable_rss: parse("REDLIB_ENABLE_RSS"),
 			full_url: parse("REDLIB_FULL_URL"),
 			default_remove_default_feeds: parse("REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS"),
+			default_keyword_filters: parse("REDLIB_DEFAULT_KEYWORD_FILTERS"),
+			default_sub_keyword_filters: parse("REDLIB_DEFAULT_SUB_KEYWORD_FILTERS"),
+			default_hide_filtered: parse("REDLIB_DEFAULT_HIDE_FILTERED"),
 		}
 	}
 }
@@ -186,6 +198,9 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 		"REDLIB_ENABLE_RSS" => config.enable_rss.clone(),
 		"REDLIB_FULL_URL" => config.full_url.clone(),
 		"REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS" => config.default_remove_default_feeds.clone(),
+		"REDLIB_DEFAULT_KEYWORD_FILTERS" => config.default_keyword_filters.clone(),
+		"REDLIB_DEFAULT_SUB_KEYWORD_FILTERS" => config.default_sub_keyword_filters.clone(),
+		"REDLIB_DEFAULT_HIDE_FILTERED" => config.default_hide_filtered.clone(),
 		_ => None,
 	}
 }
@@ -261,6 +276,14 @@ mod tests {
 	#[sealed_test(env = [("REDLIB_DEFAULT_FILTERS", "news+bestof")])]
 	fn test_default_filters() {
 		assert_eq!(get_setting("REDLIB_DEFAULT_FILTERS"), Some("news+bestof".into()));
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_DEFAULT_KEYWORD_FILTERS", "election+crypto*"), ("REDLIB_DEFAULT_SUB_KEYWORD_FILTERS", "politic"), ("REDLIB_DEFAULT_HIDE_FILTERED", "on")])]
+	fn test_default_keyword_filters() {
+		assert_eq!(get_setting("REDLIB_DEFAULT_KEYWORD_FILTERS"), Some("election+crypto*".into()));
+		assert_eq!(get_setting("REDLIB_DEFAULT_SUB_KEYWORD_FILTERS"), Some("politic".into()));
+		assert_eq!(get_setting("REDLIB_DEFAULT_HIDE_FILTERED"), Some("on".into()));
 	}
 
 	#[test]

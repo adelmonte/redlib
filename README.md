@@ -443,6 +443,10 @@ Assign a default value for each user-modifiable setting by passing environment v
 | `HIDE_SIDEBAR_AND_SUMMARY`          | `["on", "off"]`                                                                                                                                                                                                                 | `off`         |
 | `FIXED_NAVBAR`                      | `["on", "off"]`                                                                                                                                                                                                                 | `on`          |
 | `REMOVE_DEFAULT_FEEDS`              | `["on", "off"]`                                                                                                                                                                                                                 | `off`         |
+| `FILTERS`                           | `+`-delimited list of subreddits and `u_`-prefixed users to filter (case-insensitive)                                                                                                                                           | _(none)_      |
+| `KEYWORD_FILTERS`                   | `+`-delimited list of whole words/phrases hiding posts and comments by title, text or flair (`*` matches a word ending, percent-encode spaces as `%20`)                                                                         | _(none)_      |
+| `SUB_KEYWORD_FILTERS`               | `+`-delimited list of substrings; any subreddit whose name contains one is filtered                                                                                                                                             | _(none)_      |
+| `HIDE_FILTERED`                     | `["on", "off"]`: `on` drops filtered content silently and blocks direct links to it instead of showing notices                                                                                                                  | `off`         |
 
 ## Forward Proxies
 

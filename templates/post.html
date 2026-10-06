@@ -49,6 +49,9 @@
 
 {% block content %}
 	<div id="column_one">
+		{% if is_filtered %}
+		<span class="listing_warn">(This post matches your filters)</span>
+		{% endif %}
 		{% call utils::post(post) %}
 
 		<!-- SORT FORM -->

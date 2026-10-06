@@ -96,7 +96,7 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 	// If search is not restricted to this subreddit, show other subreddits in search results
 	let subreddits = if param(&path, "restrict_sr").is_none() {
 		let mut subreddits = search_subreddits(&query, &typed).await;
-		subreddits.retain(|s| !filters.contains(s.name.as_str()));
+		subreddits.retain(|s| !filters.sub_filtered(&s.name));
 		subreddits
 	} else {
 		Vec::new()
@@ -105,7 +105,10 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
 
 	// If all requested subs are filtered, we don't need to fetch posts.
-	if sub.split('+').all(|s| filters.contains(s)) {
+	if sub.split('+').all(|s| filters.sub_filtered(s)) {
+		if filters.hide {
+			return error(req, &format!("r/{sub} has been filtered")).await;
+		}
 		Ok(template(&SearchTemplate {
 			posts: Vec::new(),
 			subreddits,

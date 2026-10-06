@@ -4,12 +4,13 @@ use crate::config::get_setting;
 use crate::server::RequestExt;
 use crate::subreddit::{can_access_quarantine, quarantine};
 use crate::utils::{
-	error, format_num, get_filters, nsfw_landing, param, parse_post, rewrite_emotes, setting, template, time, val, Author, Awards, Comment, Flair, FlairPart, Post, Preferences,
+	error, format_num, get_filters, nsfw_landing, param, parse_post, rewrite_emotes, setting, template, time, val, Author, Awards, Comment, Filters, Flair, FlairPart, Post,
+	Preferences,
 };
 use askama::Template;
 use hyper::{Body, Request, Response};
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 // STRUCTS
@@ -21,6 +22,8 @@ struct PostTemplate {
 	sort: String,
 	prefs: Preferences,
 	single_thread: bool,
+	/// Whether the post matches a filter (only rendered when filtered content isn't hidden).
+	is_filtered: bool,
 	url: String,
 	url_without_query: String,
 	comment_query: String,
@@ -71,6 +74,12 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				return Ok(nsfw_landing(req, req_url).await.unwrap_or_default());
 			}
 
+			let filters = get_filters(&req);
+			let is_filtered = filters.post_filtered(&post);
+			if is_filtered && filters.hide {
+				return error(req, "This post has been filtered").await;
+			}
+
 			let query_body = match COMMENT_SEARCH_CAPTURE.captures(&url) {
 				Some(captures) => captures.get(1).unwrap().as_str().replace("%20", " ").replace('+', " "),
 				None => String::new(),
@@ -81,8 +90,8 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 			let query = form.get("q").unwrap().clone().to_string();
 
 			let comments = match query.as_str() {
-				"" => parse_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment, &get_filters(&req), &req),
-				_ => query_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment, &get_filters(&req), &query, &req),
+				"" => parse_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment, &filters, &req),
+				_ => query_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment, &filters, &query, &req),
 			};
 
 			// Use the Post and Comment structs to generate a website to show users
@@ -93,6 +102,7 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				sort,
 				prefs: Preferences::new(&req),
 				single_thread,
+				is_filtered,
 				url: req_url,
 				comment_query: query,
 			}))
@@ -111,7 +121,7 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 
 // COMMENTS
 
-fn parse_comments(json: &serde_json::Value, post_link: &str, post_author: &str, highlighted_comment: &str, filters: &HashSet<String>, req: &Request<Body>) -> Vec<Comment> {
+fn parse_comments(json: &serde_json::Value, post_link: &str, post_author: &str, highlighted_comment: &str, filters: &Filters, req: &Request<Body>) -> Vec<Comment> {
 	// Parse the comment JSON into a Vector of Comments
 	let comments = json["data"]["children"].as_array().map_or(Vec::new(), std::borrow::ToOwned::to_owned);
 
@@ -127,6 +137,7 @@ fn parse_comments(json: &serde_json::Value, post_link: &str, post_author: &str, 
 			};
 			build_comment(&comment, data, replies, post_link, post_author, highlighted_comment, filters, req)
 		})
+		.filter(|c| !(filters.hide && c.is_filtered))
 		.collect()
 }
 
@@ -135,7 +146,7 @@ fn query_comments(
 	post_link: &str,
 	post_author: &str,
 	highlighted_comment: &str,
-	filters: &HashSet<String>,
+	filters: &Filters,
 	query: &str,
 	req: &Request<Body>,
 ) -> Vec<Comment> {
@@ -151,7 +162,7 @@ fn query_comments(
 		}
 
 		let c = build_comment(&comment, data, Vec::new(), post_link, post_author, highlighted_comment, filters, req);
-		if c.body.to_lowercase().contains(&query.to_lowercase()) {
+		if c.body.to_lowercase().contains(&query.to_lowercase()) && !(filters.hide && c.is_filtered) {
 			results.push(c);
 		}
 	}
@@ -166,7 +177,7 @@ fn build_comment(
 	post_link: &str,
 	post_author: &str,
 	highlighted_comment: &str,
-	filters: &HashSet<String>,
+	filters: &Filters,
 	req: &Request<Body>,
 ) -> Comment {
 	let id = val(comment, "id");
@@ -216,7 +227,7 @@ fn build_comment(
 		},
 		distinguished: val(comment, "distinguished"),
 	};
-	let is_filtered = filters.contains(&["u_", author.name.as_str()].concat());
+	let is_filtered = filters.user_filtered(&author.name) || filters.text_filtered(&val(comment, "body"));
 
 	// Many subreddits have a default comment posted about the sub's rules etc.
 	// Many Redlib users do not wish to see this kind of comment by default.

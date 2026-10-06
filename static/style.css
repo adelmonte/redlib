@@ -1691,6 +1691,25 @@ summary.comment_data {
     margin-left: auto;
 }
 
+.prefs-keywords {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    margin-top: 12px;
+}
+
+.prefs-keywords textarea {
+    margin-top: 7px;
+    padding: 7px;
+    border-radius: 5px;
+    border: none;
+    box-shadow: var(--shadow);
+    background: var(--foreground);
+    color: var(--text);
+    font-family: inherit;
+    resize: vertical;
+}
+
 .prefs select {
     border-radius: 5px;
     box-shadow: var(--shadow);

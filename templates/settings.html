@@ -146,6 +146,23 @@
 						prefs.disable_visit_reddit_confirmation=="on" %}checked{% endif %}>
 				</div>
 			</fieldset>
+			<fieldset>
+				<legend>Filters</legend>
+				<div class="prefs-group">
+					<label for="hide_filtered">Hide filtered content completely (no notices, block direct links)</label>
+					<input type="hidden" value="off" name="hide_filtered">
+					<input type="checkbox" name="hide_filtered" id="hide_filtered" {% if prefs.hide_filtered=="on" %}checked{%
+						endif %}>
+				</div>
+				<div class="prefs-keywords">
+					<label for="keyword_filters">Thread keywords: hide posts and comments whose title, text or flair contain any of these whole words or phrases (one per line, <code>*</code> matches any word ending)</label>
+					<textarea name="keyword_filters" id="keyword_filters" rows="5" placeholder="election&#10;crypto*">{{ prefs.keyword_filters.join("\n") }}</textarea>
+				</div>
+				<div class="prefs-keywords">
+					<label for="sub_keyword_filters">Subreddit keywords: hide every subreddit whose name contains any of these (one per line)</label>
+					<textarea name="sub_keyword_filters" id="sub_keyword_filters" rows="5" placeholder="politic&#10;circlejerk">{{ prefs.sub_keyword_filters.join("\n") }}</textarea>
+				</div>
+			</fieldset>
 			<input id="save" type="submit" value="Save">
 		</div>
 	</form>
