@@ -2,8 +2,8 @@
 (function () {
     const configElement = document.getElementById('video_quality');
     const qualitySetting = configElement.getAttribute('data-value');
-    if (Hls.isSupported()) {
-        var videoSources = document.querySelectorAll("video source[type='application/vnd.apple.mpegurl']");
+    function setupHlsVideos(root) {
+        var videoSources = root.querySelectorAll("video source[type='application/vnd.apple.mpegurl']");
         videoSources.forEach(function (source) {
             var playlist = source.src;
 
@@ -115,11 +115,32 @@
                 newVideo.play();
             }
         });
-    } else {
-        var videos = document.querySelectorAll("video.hls_autoplay");
+    }
+
+    function setupFallbackVideos(root) {
+        var videos = root.querySelectorAll("video.hls_autoplay");
         videos.forEach(function (video) {
             video.setAttribute("autoplay", "");
         });
     }
+
+    var setup = Hls.isSupported() ? setupHlsVideos : setupFallbackVideos;
+    setup(document);
+
+    // Handle posts inserted after load (e.g. by infinite scroll userscripts)
+    new MutationObserver(function (mutations) {
+        mutations.forEach(function (mutation) {
+            mutation.addedNodes.forEach(function (node) {
+                if (node.nodeType !== Node.ELEMENT_NODE) {
+                    return;
+                }
+                if (node.matches("video")) {
+                    setup(node.parentNode);
+                } else if (node.querySelector("video")) {
+                    setup(node);
+                }
+            });
+        });
+    }).observe(document.body, { childList: true, subtree: true });
 })();
 // @license-end
