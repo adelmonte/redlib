@@ -149,18 +149,21 @@
 			<fieldset>
 				<legend>Filters</legend>
 				<div class="prefs-group">
-					<label for="hide_filtered">Hide filtered content completely (no notices, block direct links)</label>
+					<label for="hide_filtered">Hide filtered content completely</label>
 					<input type="hidden" value="off" name="hide_filtered">
 					<input type="checkbox" name="hide_filtered" id="hide_filtered" {% if prefs.hide_filtered=="on" %}checked{%
 						endif %}>
 				</div>
+				<p class="prefs-hint">No "filtered" notices, and direct links to filtered subreddits, users and posts are blocked.</p>
 				<div class="prefs-keywords">
-					<label for="keyword_filters">Thread keywords: hide posts and comments whose title, text or flair contain any of these whole words or phrases (one per line, <code>*</code> matches any word ending)</label>
-					<textarea name="keyword_filters" id="keyword_filters" rows="5" placeholder="election&#10;crypto*">{{ prefs.keyword_filters.join("\n") }}</textarea>
+					<label for="keyword_filters">Thread keywords</label>
+					<p class="prefs-hint">Hides posts and comments whose title, text or flair contain one of these words or phrases. One per line; <code>*</code> matches any ending, e.g. <code>crypto*</code>.</p>
+					<textarea name="keyword_filters" id="keyword_filters" rows="6" spellcheck="false">{{ prefs.keyword_filters.join("\n") }}</textarea>
 				</div>
 				<div class="prefs-keywords">
-					<label for="sub_keyword_filters">Subreddit keywords: hide every subreddit whose name contains any of these (one per line)</label>
-					<textarea name="sub_keyword_filters" id="sub_keyword_filters" rows="5" placeholder="politic&#10;circlejerk">{{ prefs.sub_keyword_filters.join("\n") }}</textarea>
+					<label for="sub_keyword_filters">Subreddit keywords</label>
+					<p class="prefs-hint">Hides every subreddit whose name contains one of these. One per line.</p>
+					<textarea name="sub_keyword_filters" id="sub_keyword_filters" rows="6" spellcheck="false">{{ prefs.sub_keyword_filters.join("\n") }}</textarea>
 				</div>
 			</fieldset>
 			<input id="save" type="submit" value="Save">
